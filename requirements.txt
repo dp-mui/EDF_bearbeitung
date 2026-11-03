@@ -1,0 +1,4 @@
+numpy
+pyEDFlib>=0.1.38
+PyQt5
+pyqtgraph>=0.13

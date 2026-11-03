@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Messdaten / Patientendaten nicht versionieren
+*.edf
+*.EDF
+*.bdf
+*.BDF
+*_bloecke.csv
+*_schnitte.json
