@@ -5,17 +5,22 @@ Start:  python edf_viewer.py [datei.edf]
 from __future__ import annotations
 
 import bisect
+import glob
 import json
 import os
 import sys
 from datetime import timedelta
 
 import numpy as np
+import pyedflib
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt
 
-from edf_io import Block, Channel, Recording, block_filename, export_blocks, fmt_time, load_edf
+from edf_io import (Block, Channel, Recording, block_filename, export_blocks, find_wfdb_bin, fmt_time,
+                    load_edf, smartlab_record_name)
+
+SETTINGS = ("EDF_Bearbeitung", "EDF Schnitt-Tool")
 
 pg.setConfigOptions(background="w", foreground="k", antialias=False)
 
@@ -247,6 +252,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "Mit Einrasten sind exportierte Blöcke exakt so lang wie markiert.\n"
             "Ohne Einrasten wird beim Export der unvollständige Rest am Blockende (< 1 Datensatz) weggelassen.")
         tb.addWidget(self.chk_snap)
+        tb.addWidget(QtWidgets.QLabel("  "))
+        self.settings = QtCore.QSettings(*SETTINGS)
+        self.chk_smartlab = QtWidgets.QCheckBox("Export für SMARTLAB")
+        self.chk_smartlab.setChecked(self.settings.value("smartlab", False, type=bool))
+        self.chk_smartlab.setToolTip(
+            "Bereitet jeden Block so vor, dass SMARTLAB ihn direkt laden kann:\n"
+            "• kurze Dateinamen (höchstens 20 Zeichen, z. B. HRV_Dive_001_B002)\n"
+            "• reines EDF, Spannung in mV (Rohwerte bleiben bit-genau)\n"
+            "• zusätzlich .hea/.dat und fertige ecgpuwave-Annotationen .atr1, .atr2, …\n"
+            "In SMARTLAB dann die .dat-Datei öffnen bzw. auf SMARTlab.exe ziehen.")
+        self.chk_smartlab.toggled.connect(lambda on: self.settings.setValue("smartlab", on))
+        tb.addWidget(self.chk_smartlab)
         tb.addSeparator()
         self.act_split = tb.addAction("Automatisch einteilen…", self.auto_split)
         self.act_clear = tb.addAction("Alle Schnitte löschen", self.clear_cuts)
@@ -1100,32 +1117,65 @@ class MainWindow(QtWidgets.QMainWindow):
         if not todo:
             QtWidgets.QMessageBox.information(self, "Export", "Kein Block ist zum Export markiert.")
             return
+        smartlab = self.chk_smartlab.isChecked()
+        wfdb_bin = None
+        if smartlab:
+            if self.rec.filetype not in (pyedflib.FILETYPE_EDF, pyedflib.FILETYPE_EDFPLUS):
+                QtWidgets.QMessageBox.warning(self, "Export für SMARTLAB",
+                                              "SMARTLAB kann nur EDF (16 bit) lesen, diese Datei ist BDF.")
+                return
+            if len({ch.fs for ch in self.rec.channels}) > 1:
+                QtWidgets.QMessageBox.warning(self, "Export für SMARTLAB",
+                                              "Für SMARTLAB müssen alle Kanäle dieselbe Abtastrate haben.")
+                return
+            wfdb_bin = self._wfdb_bin()
+            if wfdb_bin is False:
+                return
         out_dir = QtWidgets.QFileDialog.getExistingDirectory(
             self, f"Zielordner für {len(todo)} Blöcke wählen", os.path.dirname(self.rec.path))
         if not out_dir:
             return
-        existing = [n for n in (block_filename(self.rec, b) for b in todo)
+        existing = [n for n in (block_filename(self.rec, b, smartlab) for b in todo)
                     if os.path.exists(os.path.join(out_dir, n))]
-        if existing:
-            r = QtWidgets.QMessageBox.question(
-                self, "Dateien überschreiben?",
-                f"{len(existing)} Datei(en) existieren bereits, z.B.\n{existing[0]}\n\nÜberschreiben?")
+        derived = []
+        if smartlab:   # SMARTLAB-Zwischenstände/Auswertungen zu diesen Namen würden sonst die neuen Daten überdecken
+            for b in todo:
+                stem = glob.escape(os.path.join(out_dir, smartlab_record_name(self.rec, b)))
+                derived += glob.glob(stem + "m.mat") + glob.glob(stem + ".ntr*")
+        if existing or derived:
+            text = ""
+            if existing:
+                text += f"{len(existing)} Datei(en) existieren bereits, z.B.\n{existing[0]}\n\n"
+            if derived:
+                text += (f"Zu {len(derived)} Datei(en) gibt es schon SMARTLAB-Auswertungen "
+                         f"(…m.mat, .ntr), z.B.\n{os.path.basename(derived[0])}\n"
+                         "Sie werden gelöscht, damit SMARTLAB die neuen Daten lädt. "
+                         "In SMARTLAB gemachte Korrekturen gehen dabei verloren.\n\n")
+            r = QtWidgets.QMessageBox.question(self, "Dateien überschreiben?", text + "Überschreiben?")
             if r != QtWidgets.QMessageBox.Yes:
                 return
 
         dlg = QtWidgets.QProgressDialog("Exportiere Blöcke…", "Abbrechen", 0, len(todo), self)
         dlg.setWindowModality(Qt.WindowModal)
         dlg.setMinimumDuration(300)
+        position = {"k": 0, "n": len(todo)}
 
         def progress(k, n, b):
+            position.update(k=k, n=n)
             dlg.setValue(k)
             dlg.setLabelText(f"Block B{b.nr} ({k + 1}/{n})")
             QtWidgets.QApplication.processEvents()
             return not dlg.wasCanceled()
 
+        def tick(text):
+            dlg.setLabelText(f"{text}  ({position['k'] + 1}/{position['n']})")
+            QtWidgets.QApplication.processEvents()
+            return not dlg.wasCanceled()
+
         QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            results = export_blocks(self.rec, self.model.blocks, out_dir, progress)
+            results = export_blocks(self.rec, self.model.blocks, out_dir, progress,
+                                    smartlab=smartlab, wfdb_bin=wfdb_bin, tick=tick)
             with open(os.path.join(out_dir, f"{self.rec.basename}_schnitte.json"), "w", encoding="utf-8") as fh:
                 json.dump(self._session_data(), fh, indent=2, ensure_ascii=False)
         except Exception as exc:
@@ -1140,14 +1190,53 @@ class MainWindow(QtWidgets.QMainWindow):
         failed = [r for r in results if r.error]
         trimmed = [r for r in ok if r.trimmed > 1e-6]
         msg = f"{len(ok)} Block-Datei(en) exportiert nach:\n{out_dir}\n\nÜbersicht: {self.rec.basename}_bloecke.csv"
-        if len(results) < len(todo):
-            msg += f"\n\nAbgebrochen nach {len(results)} von {len(todo)} Blöcken."
+        if len(results) < len(todo) or any(r.error and r.error.startswith("abgebrochen") for r in results):
+            msg += f"\n\nAbgebrochen nach {len(ok)} von {len(todo)} Blöcken."
         if trimmed:
             msg += "\n\nAm Ende gekürzt (EDF-Datensatzraster):\n" + "\n".join(
                 f"  B{r.block.nr}: {r.trimmed:.3f} s" for r in trimmed[:15])
+        if smartlab:
+            done = [r for r in ok if r.smartlab]
+            if wfdb_bin:
+                msg += ("\n\nSMARTLAB: in SMARTLAB die .dat-Datei öffnen bzw. auf SMARTlab.exe ziehen."
+                        "\necgpuwave je Kanal (Schläge / P / T):\n" + "\n".join(
+                            f"  {r.smartlab.name}: {r.smartlab.wave_summary()}" for r in done[:15]))
+            else:
+                msg += ("\n\nSMARTLAB: .hea/.dat angelegt, aber ohne ecgpuwave-Annotationen. "
+                        "SMARTLAB rechnet sie beim Öffnen selbst (dafür muss WFDB im PATH sein).")
+            problems = [f"  {r.smartlab.name}: {p}" for r in done for p in r.smartlab.problems()
+                        if wfdb_bin]
+            if problems:
+                msg += "\n\nProbleme bei ecgpuwave:\n" + "\n".join(problems[:15])
         if failed:
             msg += "\n\nNicht exportiert:\n" + "\n".join(f"  B{r.block.nr}: {r.error}" for r in failed[:15])
         QtWidgets.QMessageBox.information(self, "Export abgeschlossen", msg)
+
+    def _wfdb_bin(self):
+        """Ordner mit ecgpuwave suchen oder erfragen. None = ohne ecgpuwave, False = abbrechen."""
+        found = find_wfdb_bin(self.settings.value("wfdb_bin", "", type=str) or None)
+        if found:
+            return found
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("ecgpuwave nicht gefunden")
+        box.setText("Für die fertigen SMARTLAB-Annotationen wird ecgpuwave aus dem WFDB-Paket gebraucht "
+                    "(normalerweise C:\\wfdb-10.4.12_Win_x86_32\\wfdb\\bin).")
+        b_pick = box.addButton("Ordner wählen…", QtWidgets.QMessageBox.AcceptRole)
+        b_skip = box.addButton("Ohne Annotationen", QtWidgets.QMessageBox.DestructiveRole)
+        box.addButton("Abbrechen", QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is b_skip:
+            return None
+        if box.clickedButton() is not b_pick:
+            return False
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Ordner mit ecgpuwave.exe wählen", "C:\\")
+        found = find_wfdb_bin(folder) if folder else None
+        if not found or os.path.normcase(found) != os.path.normcase(folder):
+            QtWidgets.QMessageBox.warning(self, "ecgpuwave nicht gefunden",
+                                          f"In diesem Ordner liegt keine ecgpuwave.exe:\n{folder}")
+            return False
+        self.settings.setValue("wfdb_bin", found)
+        return found
 
 
 def main():
