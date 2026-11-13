@@ -8,3 +8,6 @@ __pycache__/
 *.BDF
 *_bloecke.csv
 *_schnitte.json
+tauchabschnitte.csv
+tiefenprofil_digitalisiert.csv
+phasen.csv
